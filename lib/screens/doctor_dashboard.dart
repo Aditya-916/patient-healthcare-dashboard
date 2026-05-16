@@ -26,15 +26,54 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
   List<Map<String, dynamic>> familyQueries = [];
   List<Map<String, dynamic>> alerts = [];
 
+  Map<String, Map<String, dynamic>> thresholds = {};
+
   final noteController = TextEditingController();
 
   RealtimeChannel? queryChannel;
+  RealtimeChannel? alertChannel;
 
   @override
   void initState() {
     super.initState();
-    fetchPatients();
+    initializeDashboard();
     listenToFamilyQueries();
+    listenToAlerts();
+  }
+  void listenToAlerts() {
+  alertChannel = supabase.channel('alerts_channel');
+
+  alertChannel!
+      .onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'alerts',
+        callback: (payload) {
+          fetchAlerts();
+        },
+      )
+      .subscribe();
+}
+
+  Future<void> initializeDashboard() async {
+    await fetchThresholds();
+    await fetchPatients();
+  }
+
+  Future<void> fetchThresholds() async {
+    try {
+      final response = await supabase.from('thresholds').select();
+
+      final Map<String, Map<String, dynamic>> loaded = {};
+
+      for (final row in response) {
+        loaded[row['vital_type']] = Map<String, dynamic>.from(row);
+      }
+
+      thresholds = loaded;
+    } catch (e) {
+      print("Thresholds Error: $e");
+    }
   }
 
   void listenToFamilyQueries() {
@@ -55,6 +94,7 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
   @override
   void dispose() {
     queryChannel?.unsubscribe();
+    alertChannel?.unsubscribe();
     noteController.dispose();
     super.dispose();
   }
@@ -124,14 +164,13 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
         );
       }
 
-      
-        oxygenData = oxygen;
-        bpData = bp;
-        sugarData = sugar;
+      oxygenData = oxygen;
+      bpData = bp;
+      sugarData = sugar;
+
       await generateAlerts();
 
       setState(() {});
-      
     } catch (e) {
       print("Vitals Error: $e");
     }
@@ -163,6 +202,7 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
           .from('alerts')
           .select()
           .eq('patient_id', selectedPatientId!)
+          .eq('resolved', false)
           .order('created_at', ascending: false);
 
       setState(() {
@@ -173,6 +213,70 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
     }
   }
 
+  int getLevel(String type, double value) {
+    final threshold = thresholds[type];
+
+    if (threshold == null) return 0;
+
+    final warningLow = threshold['warning_low'];
+    final criticalLow = threshold['critical_low'];
+    final warningHigh = threshold['warning_high'];
+    final criticalHigh = threshold['critical_high'];
+
+    if (criticalLow != null && value < (criticalLow as num).toDouble()) {
+      return 2;
+    }
+
+    if (criticalHigh != null && value > (criticalHigh as num).toDouble()) {
+      return 2;
+    }
+
+    if (warningLow != null && value < (warningLow as num).toDouble()) {
+      return 1;
+    }
+
+    if (warningHigh != null && value > (warningHigh as num).toDouble()) {
+      return 1;
+    }
+
+    return 0;
+  }
+
+  String getSeverity(int level) {
+    if (level == 2) return "Critical";
+    if (level == 1) return "Warning";
+    return "Normal";
+  }
+
+  Color levelColor(int level) {
+    if (level == 2) return Colors.red;
+    if (level == 1) return Colors.orange;
+    return Colors.green;
+  }
+
+  Future<bool> activeAlertExists({
+    required String type,
+    required String severity,
+  }) async {
+    if (selectedPatientId == null) return true;
+
+    try {
+      final response = await supabase
+          .from('alerts')
+          .select('id')
+          .eq('patient_id', selectedPatientId!)
+          .eq('type', type)
+          .eq('severity', severity)
+          .eq('resolved', false)
+          .limit(1);
+
+      return response.isNotEmpty;
+    } catch (e) {
+      print("Check Alert Error: $e");
+      return true;
+    }
+  }
+
   Future<void> createAlert({
     required String type,
     required double value,
@@ -180,15 +284,42 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
     required String message,
   }) async {
     try {
+      final exists = await activeAlertExists(
+        type: type,
+        severity: severity,
+      );
+
+      if (exists) return;
+
       await supabase.from('alerts').insert({
         'patient_id': selectedPatientId,
         'type': type,
         'value': value,
         'severity': severity,
         'message': message,
+        'resolved': false,
       });
     } catch (e) {
       print("Create Alert Error: $e");
+    }
+  }
+
+  Future<void> resolveAlert(int alertId) async {
+    try {
+      await supabase
+          .from('alerts')
+          .update({'resolved': true})
+          .eq('id', alertId);
+
+      await fetchAlerts();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Alert resolved"),
+        ),
+      );
+    } catch (e) {
+      print("Resolve Alert Error: $e");
     }
   }
 
@@ -197,38 +328,44 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
       return;
     }
 
-    final oxygen = oxygenData.last.y;
-    final bp = bpData.last.y;
-    final sugar = sugarData.last.y;
+    await checkAndCreateAlert(
+      type: "Oxygen",
+      thresholdType: "oxygen",
+      value: oxygenData.last.y,
+    );
 
-    if (oxygen < 92) {
-      await createAlert(
-        type: "Oxygen",
-        value: oxygen,
-        severity: "Critical",
-        message: "Oxygen level critically low",
-      );
-    }
+    await checkAndCreateAlert(
+      type: "Blood Pressure",
+      thresholdType: "bp",
+      value: bpData.last.y,
+    );
 
-    if (bp > 140) {
-      await createAlert(
-        type: "Blood Pressure",
-        value: bp,
-        severity: "Warning",
-        message: "Blood pressure elevated",
-      );
-    }
-
-    if (sugar > 250) {
-      await createAlert(
-        type: "Sugar",
-        value: sugar,
-        severity: "Critical",
-        message: "Sugar level dangerously high",
-      );
-    }
+    await checkAndCreateAlert(
+      type: "Sugar",
+      thresholdType: "sugar",
+      value: sugarData.last.y,
+    );
 
     await fetchAlerts();
+  }
+
+  Future<void> checkAndCreateAlert({
+    required String type,
+    required String thresholdType,
+    required double value,
+  }) async {
+    final level = getLevel(thresholdType, value);
+
+    if (level == 0) return;
+
+    final severity = getSeverity(level);
+
+    await createAlert(
+      type: type,
+      value: value,
+      severity: severity,
+      message: "$type is $severity",
+    );
   }
 
   Future<void> saveDoctorNote() async {
@@ -277,34 +414,6 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
     }
   }
 
-  int getLevel(String type, double value) {
-    if (type == "oxygen") {
-      if (value < 92) return 2;
-      if (value < 95) return 1;
-      return 0;
-    }
-
-    if (type == "bp") {
-      if (value > 140) return 2;
-      if (value > 120) return 1;
-      return 0;
-    }
-
-    if (type == "sugar") {
-      if (value > 250) return 2;
-      if (value > 140) return 1;
-      return 0;
-    }
-
-    return 0;
-  }
-
-  Color levelColor(int level) {
-    if (level == 2) return Colors.red;
-    if (level == 1) return Colors.orange;
-    return Colors.green;
-  }
-
   List<LineChartBarData> buildSegments(
     List<FlSpot> data,
     String type,
@@ -341,9 +450,9 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
     if (type == "oxygen") {
       yValues = [90, 95, 100];
     } else if (type == "bp") {
-      yValues = [100, 120, 140];
+      yValues = [80, 90, 140, 180];
     } else {
-      yValues = [100, 150, 200, 250];
+      yValues = [55, 70, 140, 250];
     }
 
     return Column(
@@ -480,12 +589,11 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
               subtitle: Text(
                 "${alert['type']} • ${alert['value']}",
               ),
-              trailing: Text(
-                severity ?? '',
-                style: TextStyle(
-                  color: color,
-                  fontWeight: FontWeight.bold,
-                ),
+              trailing: TextButton(
+                onPressed: () {
+                  resolveAlert(alert['id']);
+                },
+                child: const Text("Resolve"),
               ),
             ),
           );
