@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'screens/login_screen.dart';
 import 'screens/doctor_dashboard.dart';
 import 'screens/family_dashboard.dart';
+
+final supabase = Supabase.instance.client;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,75 +21,57 @@ Future<void> main() async {
 class PatientApp extends StatelessWidget {
   const PatientApp({super.key});
 
+  Future<Widget> getInitialScreen() async {
+    final user = supabase.auth.currentUser;
+
+    // NOT LOGGED IN
+    if (user == null) {
+      return const LoginScreen();
+    }
+
+    try {
+      final response = await supabase
+          .from('profiles')
+          .select('role')
+          .eq('email', user.email!)
+          .single();
+
+      final role = response['role'];
+
+      // DOCTOR
+      if (role == 'doctor') {
+        return const DoctorDashboard();
+      }
+
+      // FAMILY
+      return const FamilyDashboard();
+    } catch (e) {
+      return const LoginScreen();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      title: 'Patient Dashboard',
       theme: ThemeData.dark(),
-      home: const RoleSelectionScreen(),
-    );
-  }
-}
 
-class RoleSelectionScreen extends StatelessWidget {
-  const RoleSelectionScreen({super.key});
+      home: FutureBuilder<Widget>(
+        future: getInitialScreen(),
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text("Select Dashboard"),
-      ),
-
-      body: Padding(
-        padding: const EdgeInsets.all(20),
-
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            SizedBox(
-              width: double.infinity,
-
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) =>
-                          const DoctorDashboard(),
-                    ),
-                  );
-                },
-
-                child: const Text(
-                  "Doctor Dashboard",
-                ),
+        builder: (context, snapshot) {
+          // LOADING
+          if (!snapshot.hasData) {
+            return const Scaffold(
+              body: Center(
+                child: CircularProgressIndicator(),
               ),
-            ),
+            );
+          }
 
-            const SizedBox(height: 20),
-
-            SizedBox(
-              width: double.infinity,
-
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) =>
-                          const FamilyDashboard(),
-                    ),
-                  );
-                },
-
-                child: const Text(
-                  "Family Dashboard",
-                ),
-              ),
-            ),
-          ],
-        ),
+          return snapshot.data!;
+        },
       ),
     );
   }

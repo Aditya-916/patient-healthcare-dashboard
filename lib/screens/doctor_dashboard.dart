@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'login_screen.dart';
 
 final supabase = Supabase.instance.client;
 
@@ -347,11 +348,27 @@ class _DoctorDashboardState
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text(
-          "Doctor Dashboard",
-        ),
-      ),
+  title: const Text('Doctor Dashboard'),
 
+  actions: [
+    IconButton(
+      icon: const Icon(Icons.logout),
+
+      onPressed: () async {
+        await supabase.auth.signOut();
+
+        if (!context.mounted) return;
+
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => const LoginScreen(),
+          ),
+        );
+      },
+    ),
+  ],
+),
       body: Padding(
         padding: const EdgeInsets.all(16),
 

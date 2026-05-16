@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'login_screen.dart';
 
 final supabase = Supabase.instance.client;
 
@@ -174,10 +175,27 @@ class _FamilyDashboardState
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text(
-          "Family Dashboard",
-        ),
-      ),
+  title: const Text('Doctor Dashboard'),
+
+  actions: [
+    IconButton(
+      icon: const Icon(Icons.logout),
+
+      onPressed: () async {
+        await supabase.auth.signOut();
+
+        if (!context.mounted) return;
+
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => const LoginScreen(),
+          ),
+        );
+      },
+    ),
+  ],
+),
 
       body: Padding(
         padding: const EdgeInsets.all(16),
