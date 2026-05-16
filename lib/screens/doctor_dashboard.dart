@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
 import 'login_screen.dart';
 
 final supabase = Supabase.instance.client;
@@ -9,39 +10,89 @@ class DoctorDashboard extends StatefulWidget {
   const DoctorDashboard({super.key});
 
   @override
-  State<DoctorDashboard> createState() =>
-      _DoctorDashboardState();
+  State<DoctorDashboard> createState() => _DoctorDashboardState();
 }
 
-class _DoctorDashboardState
-    extends State<DoctorDashboard> {
+class _DoctorDashboardState extends State<DoctorDashboard> {
   bool loading = true;
 
-  final TextEditingController doctorController =
-      TextEditingController();
-
-  final TextEditingController responseController =
-      TextEditingController();
-
-  List<dynamic> familyQueries = [];
+  List<Map<String, dynamic>> patients = [];
+  int? selectedPatientId;
 
   List<FlSpot> oxygenData = [];
   List<FlSpot> bpData = [];
   List<FlSpot> sugarData = [];
 
+  List<Map<String, dynamic>> familyQueries = [];
+  List<Map<String, dynamic>> alerts = [];
+
+  final noteController = TextEditingController();
+
+  RealtimeChannel? queryChannel;
+
   @override
   void initState() {
     super.initState();
+    fetchPatients();
+    listenToFamilyQueries();
+  }
 
-    fetchVitals();
-    fetchFamilyQueries();
+  void listenToFamilyQueries() {
+    queryChannel = supabase.channel('family_queries_channel');
+
+    queryChannel!
+        .onPostgresChanges(
+          event: PostgresChangeEvent.insert,
+          schema: 'public',
+          table: 'family_queries',
+          callback: (payload) {
+            fetchQueries();
+          },
+        )
+        .subscribe();
+  }
+
+  @override
+  void dispose() {
+    queryChannel?.unsubscribe();
+    noteController.dispose();
+    super.dispose();
+  }
+
+  Future<void> fetchPatients() async {
+    try {
+      final response = await supabase.from('patients').select();
+
+      patients = List<Map<String, dynamic>>.from(response);
+
+      if (patients.isNotEmpty) {
+        selectedPatientId = patients.first['id'];
+
+        await fetchVitals();
+        await fetchQueries();
+        await fetchAlerts();
+      }
+
+      setState(() {
+        loading = false;
+      });
+    } catch (e) {
+      print("Patients Error: $e");
+
+      setState(() {
+        loading = false;
+      });
+    }
   }
 
   Future<void> fetchVitals() async {
+    if (selectedPatientId == null) return;
+
     try {
       final response = await supabase
           .from('vitals')
           .select()
+          .eq('patient_id', selectedPatientId!)
           .order('id');
 
       List<FlSpot> oxygen = [];
@@ -73,78 +124,156 @@ class _DoctorDashboardState
         );
       }
 
-      setState(() {
+      
         oxygenData = oxygen;
         bpData = bp;
         sugarData = sugar;
-        loading = false;
-      });
-    } catch (e) {
-      print(e);
+      await generateAlerts();
 
-      setState(() {
-        loading = false;
-      });
+      setState(() {});
+      
+    } catch (e) {
+      print("Vitals Error: $e");
     }
   }
 
-  Future<void> fetchFamilyQueries() async {
+  Future<void> fetchQueries() async {
+    if (selectedPatientId == null) return;
+
     try {
       final response = await supabase
           .from('family_queries')
           .select()
-          .order('id', ascending: false);
+          .eq('patient_id', selectedPatientId!)
+          .order('id');
 
       setState(() {
-        familyQueries = response;
+        familyQueries = List<Map<String, dynamic>>.from(response);
       });
     } catch (e) {
-      print(e);
+      print("Query Error: $e");
     }
   }
 
-  Future<void> saveDoctorNote() async {
-    final note = doctorController.text.trim();
+  Future<void> fetchAlerts() async {
+    if (selectedPatientId == null) return;
 
-    if (note.isEmpty) return;
+    try {
+      final response = await supabase
+          .from('alerts')
+          .select()
+          .eq('patient_id', selectedPatientId!)
+          .order('created_at', ascending: false);
+
+      setState(() {
+        alerts = List<Map<String, dynamic>>.from(response);
+      });
+    } catch (e) {
+      print("Alerts Error: $e");
+    }
+  }
+
+  Future<void> createAlert({
+    required String type,
+    required double value,
+    required String severity,
+    required String message,
+  }) async {
+    try {
+      await supabase.from('alerts').insert({
+        'patient_id': selectedPatientId,
+        'type': type,
+        'value': value,
+        'severity': severity,
+        'message': message,
+      });
+    } catch (e) {
+      print("Create Alert Error: $e");
+    }
+  }
+
+  Future<void> generateAlerts() async {
+    if (oxygenData.isEmpty || bpData.isEmpty || sugarData.isEmpty) {
+      return;
+    }
+
+    final oxygen = oxygenData.last.y;
+    final bp = bpData.last.y;
+    final sugar = sugarData.last.y;
+
+    if (oxygen < 92) {
+      await createAlert(
+        type: "Oxygen",
+        value: oxygen,
+        severity: "Critical",
+        message: "Oxygen level critically low",
+      );
+    }
+
+    if (bp > 140) {
+      await createAlert(
+        type: "Blood Pressure",
+        value: bp,
+        severity: "Warning",
+        message: "Blood pressure elevated",
+      );
+    }
+
+    if (sugar > 250) {
+      await createAlert(
+        type: "Sugar",
+        value: sugar,
+        severity: "Critical",
+        message: "Sugar level dangerously high",
+      );
+    }
+
+    await fetchAlerts();
+  }
+
+  Future<void> saveDoctorNote() async {
+    final note = noteController.text.trim();
+
+    if (note.isEmpty || selectedPatientId == null) return;
 
     try {
       await supabase.from('doctor_notes').insert({
         'note': note,
+        'patient_id': selectedPatientId,
       });
+
+      noteController.clear();
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text("Doctor note saved"),
         ),
       );
-
-      doctorController.clear();
     } catch (e) {
-      print(e);
+      print("Doctor Note Error: $e");
     }
   }
 
-  Future<void> sendResponse(int queryId) async {
-    final responseText = responseController.text.trim();
-
-    if (responseText.isEmpty) return;
+  Future<void> respondToQuery(
+    int queryId,
+    String response,
+  ) async {
+    if (selectedPatientId == null) return;
 
     try {
       await supabase.from('query_responses').insert({
         'query_id': queryId,
-        'response': responseText,
+        'response': response,
+        'patient_id': selectedPatientId,
       });
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text("Response sent"),
+          content: Text("Response submitted"),
         ),
       );
-
-      responseController.clear();
     } catch (e) {
-      print(e);
+      print("Response Error: $e");
     }
   }
 
@@ -227,46 +356,32 @@ class _DoctorDashboardState
             fontWeight: FontWeight.bold,
           ),
         ),
-
-        const SizedBox(height: 10),
-
+        const SizedBox(height: 12),
         SizedBox(
-          height: 220,
-
+          height: 230,
           child: LineChart(
             LineChartData(
               minX: 0,
-              maxX: 4,
-
+              maxX: data.isEmpty ? 0 : data.length - 1,
               gridData: FlGridData(show: true),
-
               borderData: FlBorderData(show: true),
-
               titlesData: FlTitlesData(
                 topTitles: AxisTitles(
-                  sideTitles:
-                      SideTitles(showTitles: false),
+                  sideTitles: SideTitles(showTitles: false),
                 ),
-
                 rightTitles: AxisTitles(
-                  sideTitles:
-                      SideTitles(showTitles: false),
+                  sideTitles: SideTitles(showTitles: false),
                 ),
-
                 leftTitles: AxisTitles(
                   sideTitles: SideTitles(
                     showTitles: true,
-                    reservedSize: 40,
-
-                    getTitlesWidget:
-                        (value, meta) {
+                    reservedSize: 35,
+                    getTitlesWidget: (value, meta) {
                       for (var v in yValues) {
                         if ((value - v).abs() < 1) {
                           return Text(
                             v.toInt().toString(),
-                            style: const TextStyle(
-                              fontSize: 10,
-                            ),
+                            style: const TextStyle(fontSize: 10),
                           );
                         }
                       }
@@ -275,13 +390,11 @@ class _DoctorDashboardState
                     },
                   ),
                 ),
-
                 bottomTitles: AxisTitles(
                   sideTitles: SideTitles(
                     showTitles: true,
-
-                    getTitlesWidget:
-                        (value, meta) {
+                    interval: 1,
+                    getTitlesWidget: (value, meta) {
                       final labels = [
                         "6 AM",
                         "9 AM",
@@ -291,12 +404,12 @@ class _DoctorDashboardState
                       ];
 
                       if (value.toInt() >= 0 &&
-                          value.toInt() <
-                              labels.length) {
-                        return Text(
-                          labels[value.toInt()],
-                          style: const TextStyle(
-                            fontSize: 10,
+                          value.toInt() < labels.length) {
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Text(
+                            labels[value.toInt()],
+                            style: const TextStyle(fontSize: 10),
                           ),
                         );
                       }
@@ -306,9 +419,7 @@ class _DoctorDashboardState
                   ),
                 ),
               ),
-
-              lineBarsData:
-                  buildSegments(data, type),
+              lineBarsData: buildSegments(data, type),
             ),
           ),
         ),
@@ -316,23 +427,71 @@ class _DoctorDashboardState
     );
   }
 
-  Widget vitalCard(String title, String value) {
+  Widget vitalCard(
+    String title,
+    String value,
+  ) {
     return Card(
-      margin: const EdgeInsets.symmetric(
-        vertical: 10,
-      ),
-
+      margin: const EdgeInsets.symmetric(vertical: 8),
       child: ListTile(
         title: Text(title),
-
         trailing: Text(
           value,
           style: const TextStyle(
-            fontSize: 20,
+            fontSize: 18,
             fontWeight: FontWeight.bold,
           ),
         ),
       ),
+    );
+  }
+
+  Widget buildAlertsSection() {
+    if (alerts.isEmpty) return const SizedBox();
+
+    return Column(
+      children: [
+        const Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            "Active Alerts",
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        const SizedBox(height: 15),
+        ...alerts.map((alert) {
+          final severity = alert['severity'];
+
+          Color color = Colors.orange;
+
+          if (severity == "Critical") {
+            color = Colors.red;
+          }
+
+          return Card(
+            color: color.withOpacity(0.2),
+            child: ListTile(
+              title: Text(
+                alert['message'] ?? '',
+              ),
+              subtitle: Text(
+                "${alert['type']} • ${alert['value']}",
+              ),
+              trailing: Text(
+                severity ?? '',
+                style: TextStyle(
+                  color: color,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          );
+        }),
+        const SizedBox(height: 30),
+      ],
     );
   }
 
@@ -348,108 +507,107 @@ class _DoctorDashboardState
 
     return Scaffold(
       appBar: AppBar(
-  title: const Text('Doctor Dashboard'),
+        title: const Text('Doctor Dashboard'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout),
+            onPressed: () async {
+              await supabase.auth.signOut();
 
-  actions: [
-    IconButton(
-      icon: const Icon(Icons.logout),
+              if (!context.mounted) return;
 
-      onPressed: () async {
-        await supabase.auth.signOut();
-
-        if (!context.mounted) return;
-
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(
-            builder: (_) => const LoginScreen(),
+              Navigator.pushReplacement(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => const LoginScreen(),
+                ),
+              );
+            },
           ),
-        );
-      },
-    ),
-  ],
-),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
-
         child: SingleChildScrollView(
           child: Column(
             children: [
+              DropdownButton<int>(
+                value: selectedPatientId,
+                isExpanded: true,
+                hint: const Text("Select Patient"),
+                items: patients.map((patient) {
+                  return DropdownMenuItem<int>(
+                    value: patient['id'],
+                    child: Text(patient['name']),
+                  );
+                }).toList(),
+                onChanged: (value) async {
+                  setState(() {
+                    selectedPatientId = value;
+                    alerts = [];
+                    oxygenData = [];
+                    bpData = [];
+                    sugarData = [];
+                    familyQueries = [];
+                  });
+
+                  await fetchVitals();
+                  await fetchQueries();
+                  await fetchAlerts();
+                },
+              ),
+              const SizedBox(height: 30),
+              buildAlertsSection(),
               buildGraph(
                 "Oxygen (SpO2 %)",
                 oxygenData,
                 "oxygen",
               ),
-
-              const SizedBox(height: 25),
-
+              const SizedBox(height: 30),
               buildGraph(
                 "Blood Pressure (mmHg)",
                 bpData,
                 "bp",
               ),
-
-              const SizedBox(height: 25),
-
+              const SizedBox(height: 30),
               buildGraph(
                 "Sugar Level (mg/dL)",
                 sugarData,
                 "sugar",
               ),
-
               const SizedBox(height: 30),
-
-              vitalCard(
-                "Current Oxygen",
-                "${oxygenData.last.y.toStringAsFixed(0)} %",
-              ),
-
-              vitalCard(
-                "Current BP",
-                "${bpData.last.y.toStringAsFixed(0)} mmHg",
-              ),
-
-              vitalCard(
-                "Current Sugar",
-                "${sugarData.last.y.toStringAsFixed(0)} mg/dL",
-              ),
-
+              if (oxygenData.isNotEmpty)
+                vitalCard(
+                  "Current Oxygen",
+                  "${oxygenData.last.y.toStringAsFixed(0)} %",
+                ),
+              if (bpData.isNotEmpty)
+                vitalCard(
+                  "Current Blood Pressure",
+                  "${bpData.last.y.toStringAsFixed(0)} mmHg",
+                ),
+              if (sugarData.isNotEmpty)
+                vitalCard(
+                  "Current Sugar",
+                  "${sugarData.last.y.toStringAsFixed(0)} mg/dL",
+                ),
               const SizedBox(height: 30),
-
               TextField(
-                controller: doctorController,
+                controller: noteController,
                 maxLines: 4,
-
-                decoration: InputDecoration(
-                  hintText:
-                      "Doctor observations...",
-
-                  border: OutlineInputBorder(
-                    borderRadius:
-                        BorderRadius.circular(16),
-                  ),
+                decoration: const InputDecoration(
+                  hintText: "Doctor observations...",
+                  border: OutlineInputBorder(),
                 ),
               ),
-
               const SizedBox(height: 15),
-
-              SizedBox(
-                width: double.infinity,
-
-                child: ElevatedButton(
-                  onPressed: saveDoctorNote,
-
-                  child: const Text(
-                    "Save Doctor Note",
-                  ),
-                ),
+              ElevatedButton(
+                onPressed: saveDoctorNote,
+                child: const Text("Save Doctor Note"),
               ),
-
               const SizedBox(height: 40),
-
               const Align(
                 alignment: Alignment.centerLeft,
-
                 child: Text(
                   "Family Queries",
                   style: TextStyle(
@@ -458,88 +616,43 @@ class _DoctorDashboardState
                   ),
                 ),
               ),
+              const SizedBox(height: 20),
+              ...familyQueries.map((query) {
+                final responseController = TextEditingController();
 
-              const SizedBox(height: 15),
-
-              ListView.builder(
-                shrinkWrap: true,
-                physics:
-                    const NeverScrollableScrollPhysics(),
-
-                itemCount: familyQueries.length,
-
-                itemBuilder: (context, index) {
-                  final query = familyQueries[index];
-
-                  return Card(
-                    margin:
-                        const EdgeInsets.symmetric(
-                      vertical: 10,
+                return Card(
+                  margin: const EdgeInsets.symmetric(vertical: 10),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          query['query'] ?? '',
+                          style: const TextStyle(fontSize: 18),
+                        ),
+                        const SizedBox(height: 15),
+                        TextField(
+                          controller: responseController,
+                          decoration: const InputDecoration(
+                            hintText: "Respond to family...",
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        ElevatedButton(
+                          onPressed: () {
+                            respondToQuery(
+                              query['id'],
+                              responseController.text,
+                            );
+                          },
+                          child: const Text("Send Response"),
+                        ),
+                      ],
                     ),
-
-                    child: Padding(
-                      padding:
-                          const EdgeInsets.all(16),
-
-                      child: Column(
-                        crossAxisAlignment:
-                            CrossAxisAlignment.start,
-
-                        children: [
-                          Text(
-                            query['query'],
-                            style: const TextStyle(
-                              fontSize: 16,
-                            ),
-                          ),
-
-                          const SizedBox(height: 12),
-
-                          TextField(
-                            controller:
-                                responseController,
-
-                            decoration:
-                                InputDecoration(
-                              hintText:
-                                  "Type response...",
-
-                              border:
-                                  OutlineInputBorder(
-                                borderRadius:
-                                    BorderRadius
-                                        .circular(
-                                  12,
-                                ),
-                              ),
-                            ),
-                          ),
-
-                          const SizedBox(height: 10),
-
-                          SizedBox(
-                            width:
-                                double.infinity,
-
-                            child: ElevatedButton(
-                              onPressed: () {
-                                sendResponse(
-                                  query['id'],
-                                );
-                              },
-
-                              child: const Text(
-                                "Send Response",
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  );
-                },
-              ),
-
+                  ),
+                );
+              }),
               const SizedBox(height: 30),
             ],
           ),
